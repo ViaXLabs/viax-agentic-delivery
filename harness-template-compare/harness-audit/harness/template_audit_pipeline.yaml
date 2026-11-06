@@ -1,0 +1,163 @@
+# Weekly audit: do deploy pipelines across the program use the platform team's required templates?
+# Publishes the result to a Confluence page through the platform team's Confluence reporting template.
+#
+# Put this file under .harness/pipelines/ in the repo that holds the harness-audit tool.
+# Every REPLACE_ME is environment-specific. Pipeline variables marked <+input> are asked at run time
+# (or supplied by the trigger's input set).
+#
+# Internal use only. Use the corporate GitHub connector / token and your approved internal image
+# registry and package index; nothing in this pipeline reaches a third-party service.
+pipeline:
+  name: Template Compliance Audit
+  identifier: Template_Compliance_Audit
+  projectIdentifier: REPLACE_ME
+  orgIdentifier: REPLACE_ME
+  description: Inventories deploy pipelines in every program repo and checks they use the required platform templates (starting with the New Relic deployment marker). Internal use only.
+  tags:
+    classification: internal
+  properties:
+    ci:
+      codebase:
+        connectorRef: REPLACE_ME_GITHUB_CONNECTOR   # corporate GitHub connector
+        repoName: harness-audit                      # the repo that holds this tool
+        build: <+input>
+  variables:
+    - name: TEAMS_FILE
+      type: String
+      description: Path, in this repo, of teams.json (team to repo mapping)
+      required: true
+      value: teams.json
+    - name: GOLDEN_REPO
+      type: String
+      description: owner/name of the golden Harness templates repo
+      required: true
+      value: <+input>
+    - name: GOLDEN_PATH
+      type: String
+      description: Folder in the golden repo that holds the templates
+      required: true
+      value: .harness
+    - name: CONFLUENCE_PAGE_ID
+      type: String
+      description: Id of the Confluence page the report overwrites on every run
+      required: true
+      value: <+input>
+    - name: FAIL_ON
+      type: String
+      description: Exit-code policy. never = inventory only; fail = non-compliant deploys fail the run; review = review items fail it too
+      required: true
+      value: never
+    - name: PYTHON_IMAGE
+      type: String
+      description: Approved internal image with Python 3.9+ and bash
+      required: true
+      value: <+input>
+    - name: PIP_INDEX_URL
+      type: String
+      description: Internal package index that serves PyYAML
+      required: true
+      value: <+input>
+    - name: GITHUB_API_URL
+      type: String
+      description: https://api.github.com, or https://HOST/api/v3 for GitHub Enterprise Server
+      required: true
+      value: <+input>
+  stages:
+    - stage:
+        name: Audit
+        identifier: Audit
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: REPLACE_ME_K8S_CONNECTOR
+              namespace: REPLACE_ME_NAMESPACE
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Fetch and scan
+                  identifier: Fetch_and_scan
+                  timeout: 30m
+                  spec:
+                    connectorRef: REPLACE_ME_REGISTRY_CONNECTOR
+                    image: <+pipeline.variables.PYTHON_IMAGE>
+                    shell: Bash
+                    envVariables:
+                      GH_TOKEN: <+secrets.getValue("REPLACE_ME_github_read_token")>
+                      GITHUB_API_URL: <+pipeline.variables.GITHUB_API_URL>
+                      PIP_INDEX_URL: <+pipeline.variables.PIP_INDEX_URL>
+                    command: |-
+                      set -euo pipefail
+                      pip install --quiet --user --index-url "$PIP_INDEX_URL" pyyaml
+
+                      echo "== 1/5 self-test (a broken auditor must not produce a report)"
+                      python -m unittest discover -s tests -q
+
+                      echo "== 2/5 fetch the golden templates"
+                      printf '[{"team":"platform","repo":"%s"}]' "<+pipeline.variables.GOLDEN_REPO>" > golden.json
+                      python -m harness_audit fetch --repos golden.json --out golden --path "<+pipeline.variables.GOLDEN_PATH>"
+
+                      echo "== 3/5 check capabilities.yaml against the golden repo"
+                      python -m harness_audit catalog --golden golden --rules capabilities.yaml --out report \
+                        || echo "WARNING: capabilities.yaml is out of sync with the golden repo (see above)"
+
+                      echo "== 4/5 fetch every team repo's .harness folder"
+                      python -m harness_audit fetch --repos "<+pipeline.variables.TEAMS_FILE>" --out snapshot
+
+                      echo "== 5/5 scan (writes report/report.html for Confluence)"
+                      rc=0
+                      python -m harness_audit scan --snapshot snapshot --golden golden --rules capabilities.yaml \
+                        --out report --fail-on "<+pipeline.variables.FAIL_ON>" || rc=$?
+                      cat report/summary.md
+                      # rc 2 = the FAIL_ON policy tripped; the report exists and must still be published.
+                      # rc 3 = bad rules or configuration; there is nothing worth publishing.
+                      if [ "$rc" -ge 3 ]; then exit "$rc"; fi
+                      echo "$rc" > report/exit_code
+
+              # Publish report/report.html as the body of the Confluence page, using the platform team's
+              # Confluence reporting template.
+              #
+              # REPLACE the three values below. templateInputs is a GUESS at the template's input schema
+              # (a Run-type step template taking the page id and the HTML file path as environment variables).
+              # Open the template, copy its runtime-input block here, and map the two values onto it.
+              #
+              # The file is an HTML fragment (no <html>/<body>), valid as Confluence storage format.
+              # If your template also accepts attachments, pass report/repos.csv, report/stages.csv and
+              # report/templates.csv as well.
+              - step:
+                  name: Publish to Confluence
+                  identifier: Publish_to_Confluence
+                  template:
+                    templateRef: REPLACE_CONFLUENCE_TEMPLATE
+                    versionLabel: REPLACE_TEMPLATE_VERSION
+                    templateInputs:
+                      type: Run
+                      spec:
+                        envVariables:
+                          CONFLUENCE_PAGE_ID: <+pipeline.variables.CONFLUENCE_PAGE_ID>
+                          REPORT_HTML: report/report.html
+
+              # Applies the FAIL_ON policy only after the page is published, so a failing audit
+              # still updates Confluence. With FAIL_ON=never this step always passes.
+              - step:
+                  type: Run
+                  name: Apply policy
+                  identifier: Apply_policy
+                  timeout: 2m
+                  spec:
+                    connectorRef: REPLACE_ME_REGISTRY_CONNECTOR
+                    image: <+pipeline.variables.PYTHON_IMAGE>
+                    shell: Bash
+                    command: |-
+                      set -euo pipefail
+                      rc="$(cat report/exit_code)"
+                      if [ "$rc" -ne 0 ]; then
+                        echo "Policy FAIL_ON=<+pipeline.variables.FAIL_ON> tripped. Details are on the Confluence page and in report/summary.md."
+                      fi
+                      exit "$rc"

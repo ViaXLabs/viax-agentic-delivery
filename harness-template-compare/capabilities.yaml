@@ -1,0 +1,60 @@
+# capabilities.yaml  (owned by the platform team; the only file that changes when a requirement changes)
+#
+# A capability is something every deploy must do. It is satisfied by a canonical template,
+# and recognised in the wild (hand-rolled copies) by fingerprints.
+# Adding a new required template = adding one block under `capabilities:`. No code changes.
+
+policy:
+  # Where must the marker sit, relative to a deploy stage?
+  #   same_stage           inside that stage's own steps
+  #   same_or_later_stage  inside that stage or any later stage of the pipeline   (default)
+  #   pipeline             anywhere in the pipeline
+  coverage: same_or_later_stage
+
+  # Stage `type` values that are real deployments.
+  deploy_stage_types: [Deployment]
+
+  # A marker that only runs on rollback is not a deployment marker.
+  count_rollback_steps: false
+
+  # Heuristic for CI / Custom stages that deploy through shell commands instead of a
+  # Deployment stage. Matches are reported as deploy_kind=heuristic so a human can confirm.
+  deploy_commands:
+    - '\bhelm\s+(upgrade|install)\b'
+    - '\bkubectl\s+(apply|rollout|set\s+image|replace)\b'
+    - '\bterraform\s+apply\b'
+    - '\btofu\s+apply\b'
+    - '\bargocd\s+app\s+sync\b'
+    - '\baws\s+ecs\s+update-service\b'
+    - '\baws\s+lambda\s+update-function-code\b'
+    - '\b(serverless|sls|cdk)\s+deploy\b'
+
+capabilities:
+
+  nr_deployment_marker:
+    description: >
+      Records a New Relic change-tracking deployment marker (NerdGraph
+      changeTrackingCreateDeployment) when an application is deployed.
+    required: true
+
+    templates:
+      - ident: NR_Deployment_Marker        # REPLACE: the identifier of the platform template (not its display name)
+        scopes: [account]                  # where the canonical template lives: account | org | project
+        versions:                          # delete this block to accept every version
+          current: ["v2.0.0"]              # REPLACE with your real versionLabels
+          deprecated: ["v1.0.0", "v1.1.0"] # still counts as using the template, reported as 'outdated'
+          blocked: []                      # must not be used; reported as 'blocked'
+
+    # Strong = this text IS the implementation. A deploy stage containing it, without the
+    # template, is reported as 'inline' (hand-rolled). Keep these specific.
+    # `python -m harness_audit catalog` prints suggested keywords taken from the golden template itself.
+    strong:
+      - {name: nerdgraph-deployment-mutation, regex: 'changeTrackingCreateDeployment'}
+      - {name: rest-v2-deployments,           regex: 'v2/applications/.+/deployments\.json'}
+      - {name: newrelic-cli-deployment,       regex: 'newrelic\s+entity\s+deployment\s+create'}
+
+    # Weak = suggestive only. Never counts as compliant or non-compliant; yields 'review'.
+    weak:
+      - {name: nerdgraph-change-event, regex: 'changeTrackingCreateEvent'}
+      - {name: nerdgraph-endpoint,     regex: 'api\.(eu\.)?newrelic\.com/graphql'}
+      - {name: marker-wording,         regex: 'deployment[ _-]?marker'}
